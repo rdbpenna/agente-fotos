@@ -1,0 +1,13 @@
+Estou trabalhando num projeto Python chamado "Agente de Fotos Imobiliárias".
+É uma ferramenta local para Windows com interface gráfica (tkinter) que automatiza
+a organização e pré-edição de fotos de imóveis usando OpenCV e Pillow.
+
+O projeto já está funcional. Antes de fazer qualquer alteração, leia os arquivos:
+- CLAUDE.md (como o projeto funciona e regras para trabalhar nele)
+- PROGRESSO.md (o que já está pronto, bugs conhecidos e próximos passos)
+
+Não recrie o projeto do zero. Trabalhe sobre o código existente.
+Não altere funcionalidades sem me explicar antes o que vai mudar.
+
+Os arquivos estão na pasta do projeto que vou enviar/indicar.
+Me diga o que você entendeu da estrutura antes de começar a fazer mudanças.
