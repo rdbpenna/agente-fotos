@@ -1,55 +1,132 @@
 """
-Upscale profissional para fotos imobiliárias.
+Upscale com Real-ESRGAN via ONNX Runtime.
 
-Pipeline: pré-denoise → upscale Lanczos → enhance por preset → unsharp mask controlada.
-3 presets: natural_pro, strong_pro, luxury.
-Mesma interface pública: upscale_file(image_path) → str.
+Pipeline: tile-based inference → stitch → resize ao fator solicitado.
+Modelo: RealESRGAN_x4plus (nativo 4x, ~66MB ONNX).
+Fallback: Lanczos se o modelo não estiver disponível.
 """
 
 import os
 import cv2
 import numpy as np
+import logging
+
+logger = logging.getLogger("agente.upscaler")
+
+# Caminho do modelo ONNX relativo à raiz do projeto
+_MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+_MODEL_PATH = os.path.join(_MODEL_DIR, "realesrgan-x4plus.onnx")
+
+# Sessão ONNX carregada uma vez (lazy)
+_ort_session = None
 
 
-UPSCALE_PRESETS = {
-    "natural_pro": {
-        "denoise_h": 3,           # leve — preserva textura
-        "clahe_clip": 1.4,
-        "clahe_blend": 0.18,
-        "shadow_lift": 4.0,
-        "highlight_protect": 3.0,
-        "white_neutralize_b": -0.6,
-        "sharpen_amount": 1.08,
-        "sharpen_sigma": 1.4,
-        "saturation": 1.01,
-    },
-    "strong_pro": {
-        "denoise_h": 4,
-        "clahe_clip": 1.8,
-        "clahe_blend": 0.25,
-        "shadow_lift": 6.0,
-        "highlight_protect": 4.0,
-        "white_neutralize_b": -0.8,
-        "sharpen_amount": 1.12,
-        "sharpen_sigma": 1.2,
-        "saturation": 1.03,
-    },
-    "luxury": {
-        "denoise_h": 5,           # mais limpo
-        "clahe_clip": 1.5,
-        "clahe_blend": 0.20,
-        "shadow_lift": 5.0,
-        "highlight_protect": 5.0,
-        "white_neutralize_b": -1.0,
-        "sharpen_amount": 1.06,   # suave — look premium
-        "sharpen_sigma": 1.6,
-        "saturation": 1.00,
-    },
-}
+def _get_session():
+    """Carrega o modelo ONNX uma única vez (singleton)."""
+    global _ort_session
+    if _ort_session is not None:
+        return _ort_session
+
+    if not os.path.isfile(_MODEL_PATH):
+        logger.warning(f"Modelo ONNX não encontrado em {_MODEL_PATH} — usando fallback Lanczos")
+        return None
+
+    try:
+        import onnxruntime as ort
+        providers = ["CPUExecutionProvider"]
+        # Usa GPU se disponível
+        if "CUDAExecutionProvider" in ort.get_available_providers():
+            providers.insert(0, "CUDAExecutionProvider")
+        _ort_session = ort.InferenceSession(_MODEL_PATH, providers=providers)
+        logger.info(f"Real-ESRGAN carregado ({os.path.getsize(_MODEL_PATH) / 1024 / 1024:.0f}MB)")
+        return _ort_session
+    except ImportError:
+        logger.warning("onnxruntime não instalado — usando fallback Lanczos")
+        return None
+    except Exception as e:
+        logger.error(f"Erro ao carregar modelo ONNX: {e}")
+        return None
+
+
+def _esrgan_tile(session, tile_bgr: np.ndarray) -> np.ndarray:
+    """Processa um tile pelo modelo Real-ESRGAN. Input/output BGR uint8."""
+    # BGR → RGB, uint8 → float32 [0,1], HWC → NCHW
+    rgb = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    tensor = np.transpose(rgb, (2, 0, 1))[np.newaxis, ...]  # [1, 3, H, W]
+
+    input_name = session.get_inputs()[0].name
+    output = session.run(None, {input_name: tensor})[0]  # [1, 3, H*4, W*4]
+
+    # NCHW → HWC, float32 [0,1] → uint8, RGB → BGR
+    result = np.clip(output[0], 0, 1)
+    result = np.transpose(result, (1, 2, 0))  # HWC
+    result = (result * 255.0).round().astype(np.uint8)
+    return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+
+
+def _esrgan_upscale(img_bgr: np.ndarray, tile_size: int = 256, tile_pad: int = 16) -> np.ndarray:
+    """
+    Upscale 4x com Real-ESRGAN usando processamento por tiles.
+    Tiles evitam OOM em imagens grandes. Overlap (tile_pad) evita artefatos nas bordas.
+    """
+    session = _get_session()
+    if session is None:
+        return None
+
+    h, w = img_bgr.shape[:2]
+    scale = 4
+    out_h, out_w = h * scale, w * scale
+    output = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+
+    # Calcula grid de tiles
+    tiles_y = max(1, (h + tile_size - 1) // tile_size)
+    tiles_x = max(1, (w + tile_size - 1) // tile_size)
+
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            # Coordenadas do tile no input (com padding)
+            y_start = ty * tile_size
+            x_start = tx * tile_size
+            y_end = min(y_start + tile_size, h)
+            x_end = min(x_start + tile_size, w)
+
+            # Expande com padding para evitar artefatos de borda
+            y_start_pad = max(0, y_start - tile_pad)
+            x_start_pad = max(0, x_start - tile_pad)
+            y_end_pad = min(h, y_end + tile_pad)
+            x_end_pad = min(w, x_end + tile_pad)
+
+            tile = img_bgr[y_start_pad:y_end_pad, x_start_pad:x_end_pad]
+
+            # Inferência
+            try:
+                result_tile = _esrgan_tile(session, tile)
+            except Exception as e:
+                logger.error(f"Erro no tile ({tx},{ty}): {e}")
+                # Fallback: Lanczos para este tile
+                th, tw = tile.shape[:2]
+                result_tile = cv2.resize(tile, (tw * scale, th * scale),
+                                         interpolation=cv2.INTER_LANCZOS4)
+
+            # Recorta o padding do resultado (escala 4x)
+            crop_top = (y_start - y_start_pad) * scale
+            crop_left = (x_start - x_start_pad) * scale
+            crop_bottom = crop_top + (y_end - y_start) * scale
+            crop_right = crop_left + (x_end - x_start) * scale
+
+            cropped = result_tile[crop_top:crop_bottom, crop_left:crop_right]
+
+            # Cola no output
+            out_y = y_start * scale
+            out_x = x_start * scale
+            ch, cw = cropped.shape[:2]
+            output[out_y:out_y + ch, out_x:out_x + cw] = cropped
+
+    return output
 
 
 class ImageUpscaler:
-    """Amplia e melhora fotos com pipeline profissional."""
+    """Upscale com Real-ESRGAN (IA) + fallback Lanczos."""
 
     def __init__(self, factor: float = 2.0, preset: str = "natural_pro"):
         try:
@@ -57,11 +134,10 @@ class ImageUpscaler:
         except Exception:
             factor = 2.0
         self.factor = max(1.0, min(4.0, factor))
-        self.preset_name = preset if preset in UPSCALE_PRESETS else "natural_pro"
-        self.cfg = UPSCALE_PRESETS[self.preset_name]
+        self.preset_name = preset
 
     def upscale_file(self, image_path: str) -> str:
-        """Amplia e melhora a imagem, sobrescreve o arquivo."""
+        """Upscale a imagem, sobrescreve o arquivo. Retorna log string."""
         img = cv2.imread(image_path)
         if img is None:
             return "Upscale: imagem não pôde ser lida"
@@ -70,118 +146,50 @@ class ImageUpscaler:
         if self.factor <= 1.01:
             return "Upscale: fator 1x — ignorado"
 
-        # ── 1. Pré-denoise (antes do upscale para não ampliar ruído) ──
-        img = self._pre_denoise(img)
+        # Tenta Real-ESRGAN (sempre 4x nativo)
+        esrgan_result = _esrgan_upscale(img)
 
-        # ── 2. Upscale Lanczos ──
-        new_w, new_h = self._calc_size(w, h)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        if esrgan_result is not None:
+            # O modelo gera 4x. Se o fator solicitado é diferente, redimensiona.
+            if abs(self.factor - 4.0) > 0.1:
+                target_w = int(round(w * self.factor))
+                target_h = int(round(h * self.factor))
+                target_w, target_h = self._clamp_size(target_w, target_h)
+                esrgan_result = cv2.resize(esrgan_result, (target_w, target_h),
+                                           interpolation=cv2.INTER_LANCZOS4)
+            else:
+                target_w, target_h = esrgan_result.shape[1], esrgan_result.shape[0]
+                target_w, target_h = self._clamp_size(target_w, target_h)
+                if (target_w, target_h) != (esrgan_result.shape[1], esrgan_result.shape[0]):
+                    esrgan_result = cv2.resize(esrgan_result, (target_w, target_h),
+                                               interpolation=cv2.INTER_LANCZOS4)
 
-        # ── 3. Enhance pós-upscale ──
-        img = self._enhance_luminance(img)
-        img = self._neutralize_whites(img)
-        img = self._adjust_saturation(img)
-        img = self._sharpen(img)
+            method = "Real-ESRGAN"
+            final = esrgan_result
+        else:
+            # Fallback: Lanczos + unsharp mask leve
+            target_w = int(round(w * self.factor))
+            target_h = int(round(h * self.factor))
+            target_w, target_h = self._clamp_size(target_w, target_h)
+            final = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+            # Unsharp mask leve para compensar suavização do Lanczos
+            blur = cv2.GaussianBlur(final, (0, 0), 1.2)
+            final = cv2.addWeighted(final, 1.06, blur, -0.06, 0)
+            method = "Lanczos (fallback)"
 
-        # ── 4. Salvar ──
+        # Salvar
         ext = os.path.splitext(image_path)[1].lower()
         params = [cv2.IMWRITE_JPEG_QUALITY, 98] if ext in {".jpg", ".jpeg"} else []
-        cv2.imwrite(image_path, img, params)
+        cv2.imwrite(image_path, final, params)
 
-        return (f"Upscale [{self.preset_name}]: {w}x{h} → {new_w}x{new_h} "
-                f"({self.factor:g}x)")
+        final_h, final_w = final.shape[:2]
+        return f"Upscale [{method}]: {w}x{h} → {final_w}x{final_h} ({self.factor:g}x)"
 
-    # ── Etapas ────────────────────────────────────────────────────
-
-    def _pre_denoise(self, img: np.ndarray) -> np.ndarray:
-        """Non-local means leve — limpa ruído antes de ampliar."""
-        h_val = self.cfg["denoise_h"]
-        if h_val <= 0:
-            return img
-        return cv2.fastNlMeansDenoisingColored(img, None, h_val, h_val, 7, 21)
-
-    def _enhance_luminance(self, img: np.ndarray) -> np.ndarray:
-        """CLAHE suave + lift de sombras + proteção de altas-luzes."""
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-
-        # CLAHE no canal L
-        clip = self.cfg["clahe_clip"]
-        blend = self.cfg["clahe_blend"]
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-        l_clahe = clahe.apply(l.astype(np.uint8)).astype(np.float32)
-        l = l * (1.0 - blend) + l_clahe * blend
-
-        # Lift sombras (só pixels escuros)
-        shadow_mask = np.clip((100.0 - l) / 100.0, 0.0, 1.0)
-        l += self.cfg["shadow_lift"] * shadow_mask
-
-        # Protege altas-luzes (puxa brancos estourados)
-        highlight_mask = np.clip((l - 220.0) / 35.0, 0.0, 1.0)
-        l -= self.cfg["highlight_protect"] * highlight_mask
-
-        l = np.clip(l, 0, 255)
-        result = cv2.merge([l, a, b]).astype(np.uint8)
-        return cv2.cvtColor(result, cv2.COLOR_LAB2BGR)
-
-    def _neutralize_whites(self, img: np.ndarray) -> np.ndarray:
-        """Corrige cast amarelo/azul em brancos — seletivo por luminosidade."""
-        b_shift = self.cfg["white_neutralize_b"]
-        if abs(b_shift) < 0.1:
-            return img
-
-        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-        l, a, b = cv2.split(lab)
-
-        # Só aplica em pixels claros (paredes, teto)
-        light_mask = np.clip((l - 140.0) / 80.0, 0.0, 1.0)
-        b += b_shift * light_mask
-        a += (b_shift * 0.3) * light_mask  # compensação leve no canal a
-
-        lab = cv2.merge([l, np.clip(a, 0, 255), np.clip(b, 0, 255)]).astype(np.uint8)
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    def _adjust_saturation(self, img: np.ndarray) -> np.ndarray:
-        """Saturação leve e seletiva — protege pixels já saturados."""
-        factor = self.cfg["saturation"]
-        if abs(factor - 1.0) < 0.005:
-            return img
-
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.float32)
-        s = hsv[:, :, 1]
-
-        # Vibrance: satura mais os dessaturados
-        low_mask = np.clip((90.0 - s) / 70.0, 0.0, 1.0)
-        effective = 1.0 + (factor - 1.0) * (0.5 + 0.5 * low_mask)
-        hsv[:, :, 1] = np.clip(s * effective, 0, 240)
-
-        return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
-
-    def _sharpen(self, img: np.ndarray) -> np.ndarray:
-        """Unsharp mask controlada — preserva superfícies lisas."""
-        amount = self.cfg["sharpen_amount"]
-        sigma = self.cfg["sharpen_sigma"]
-
-        blurred = cv2.GaussianBlur(img, (0, 0), sigma)
-        sharpened = cv2.addWeighted(img, amount, blurred, 1.0 - amount, 0)
-
-        # Blend adaptativo: aplica menos onde a imagem é lisa (paredes, céu)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        local_var = cv2.GaussianBlur(gray ** 2, (15, 15), 0) - cv2.GaussianBlur(gray, (15, 15), 0) ** 2
-        detail_mask = np.clip(local_var / 600.0, 0.15, 1.0)  # mínimo 15% em áreas lisas
-        detail_mask_3ch = np.stack([detail_mask] * 3, axis=-1)
-
-        result = (sharpened.astype(np.float32) * detail_mask_3ch +
-                  img.astype(np.float32) * (1.0 - detail_mask_3ch))
-        return np.clip(result, 0, 255).astype(np.uint8)
-
-    def _calc_size(self, w: int, h: int) -> tuple[int, int]:
-        """Calcula tamanho final com limite de segurança."""
-        new_w = int(round(w * self.factor))
-        new_h = int(round(h * self.factor))
-        max_side = 9000
-        if max(new_w, new_h) > max_side:
-            scale = max_side / max(new_w, new_h)
-            new_w = int(round(new_w * scale))
-            new_h = int(round(new_h * scale))
-        return new_w, new_h
+    @staticmethod
+    def _clamp_size(w: int, h: int, max_side: int = 9000) -> tuple[int, int]:
+        """Limita tamanho máximo para segurança."""
+        if max(w, h) > max_side:
+            scale = max_side / max(w, h)
+            w = int(round(w * scale))
+            h = int(round(h * scale))
+        return w, h

@@ -7,8 +7,8 @@ Pillow>=10.0.0
 customtkinter>=5.2.0
 PySide6>=6.5.0
 
-# Opcional: classificação com modelo de IA (descomente se quiser usar)
-# onnxruntime>=1.16.0
+# Upscale com Real-ESRGAN (IA) — recomendado
+onnxruntime>=1.16.0
 
 # Suporte a RAW Canon/Nikon/Sony/DNG, incluindo .CR3
 rawpy>=0.21.0
