@@ -64,7 +64,7 @@ def _esrgan_tile(session, tile_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
 
 
-def _esrgan_upscale(img_bgr: np.ndarray, tile_size: int = 256, tile_pad: int = 16) -> np.ndarray:
+def _esrgan_upscale(img_bgr: np.ndarray, tile_size: int = 512, tile_pad: int = 16) -> np.ndarray:
     """
     Upscale 4x com Real-ESRGAN usando processamento por tiles.
     Tiles evitam OOM em imagens grandes. Overlap (tile_pad) evita artefatos nas bordas.
@@ -146,8 +146,23 @@ class ImageUpscaler:
         if self.factor <= 1.01:
             return "Upscale: fator 1x — ignorado"
 
+        # Smart downscale: se a imagem é muito grande, reduz antes do ESRGAN
+        # para que o 4x nativo produza o tamanho final desejado.
+        # Ex: foto 6000x4000, fator 2x → target 12000x8000
+        #     Sem otimização: ESRGAN em 6000x4000 (lento) → resize down
+        #     Com otimização: resize 3000x2000 → ESRGAN 4x → 12000x8000
+        target_w = int(round(w * self.factor))
+        target_h = int(round(h * self.factor))
+        pre_scale = self.factor / 4.0  # quanto menor que 4x, mais reduz antes
+        if pre_scale < 0.9 and max(w, h) > 1500:
+            pre_w = max(512, int(round(w * pre_scale)))
+            pre_h = max(512, int(round(h * pre_scale)))
+            img = cv2.resize(img, (pre_w, pre_h), interpolation=cv2.INTER_LANCZOS4)
+            logger.info(f"Smart pre-scale: {w}x{h} → {pre_w}x{pre_h} antes do ESRGAN")
+            h, w = pre_h, pre_w
+
         # Tenta Real-ESRGAN (sempre 4x nativo)
-        esrgan_result = _esrgan_upscale(img)
+        esrgan_result = _esrgan_upscale(img, tile_size=512)
 
         if esrgan_result is not None:
             # O modelo gera 4x. Se o fator solicitado é diferente, redimensiona.
